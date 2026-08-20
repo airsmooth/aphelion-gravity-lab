@@ -1,7 +1,9 @@
 {
   "name": "aphelion-gravity-lab",
-  "version": "0.1.0",
+  "version": "1.0.1",
+  "description": "Interactive N-body gravity simulation desktop laboratory",
   "private": true,
+  "main": "desktop/main.cjs",
   "engines": {
     "node": ">=22.13.0"
   },
@@ -11,6 +13,12 @@
     "start": "vinext start",
     "test": "npm run build && node --test tests/rendered-html.test.mjs tests/physics-engine.test.mjs tests/physics.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "desktop:renderer": "vite build --config vite.desktop.config.ts",
+    "desktop:typecheck": "tsc --project tsconfig.desktop.json --noEmit",
+    "desktop:run": "npm run desktop:renderer && electron .",
+    "desktop:smoke": "npm run desktop:renderer && electron . --smoke-test",
+    "desktop:package": "npm run desktop:renderer && electron-builder --win portable --x64",
+    "desktop:unpacked": "npm run desktop:renderer && electron-builder --win dir --x64",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
@@ -30,6 +38,8 @@
     "@vitejs/plugin-react": "6.0.2",
     "@vitejs/plugin-rsc": "0.5.26",
     "drizzle-kit": "0.31.10",
+    "electron": "^43.4.1",
+    "electron-builder": "^26.15.3",
     "eslint": "9.39.4",
     "eslint-plugin-jsx-a11y": "6.10.2",
     "eslint-plugin-react": "7.37.5",
@@ -43,5 +53,31 @@
     "vite": "8.0.13",
     "wrangler": "4.92.0"
   },
-  "type": "module"
+  "type": "module",
+  "build": {
+    "appId": "com.aphelion.gravitylab",
+    "productName": "Aphelion Gravity Lab",
+    "artifactName": "Aphelion-Gravity-Lab-${version}-Portable.${ext}",
+    "asar": true,
+    "compression": "normal",
+    "npmRebuild": false,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "desktop/main.cjs",
+      "desktop-dist/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    }
+  }
 }

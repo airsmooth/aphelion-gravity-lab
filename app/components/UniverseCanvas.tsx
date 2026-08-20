@@ -45,6 +45,14 @@ const DEFAULT_DISPLAY: UniverseDisplayOptions = {
 
 const MIN_ZOOM = 1e-15;
 const MAX_ZOOM = 1e2;
+const MAX_CAMERA_COORDINATE = 1e30;
+const MAX_GRID_LINES_PER_AXIS = 256;
+const MAX_CANVAS_PIXELS = 16_000_000;
+const MAX_VISIBLE_TRAIL_VERTICES = 8_000;
+const MIN_RENDER_FPS = 1;
+const MAX_RENDER_FPS = 120;
+const RENDER_FAILURE_LOG_INTERVAL = 10_000;
+const MAX_RENDER_RETRY_DELAY = 2_000;
 const TWO_PI = Math.PI * 2;
 
 /** Camera coordinates are in the translated reference frame; zoom is CSS pixels per metre. */
@@ -105,6 +113,8 @@ export interface UniverseCanvasProps {
   vectorScale?: number;
   /** Approximate spacing of gravity-field samples in CSS pixels. */
   gravityFieldDensity?: number;
+  /** Maximum canvas redraw rate. Defaults to 60 interactive, 24 passive, or 12 while held. */
+  renderFps?: number;
   minZoom?: number;
   maxZoom?: number;
   interactive?: boolean;
@@ -182,6 +192,7 @@ interface LatestRenderData {
   hud: UniverseHud;
   vectorScale: number;
   gravityFieldDensity: number;
+  renderFps: number;
   canDragVelocity: boolean;
 }
 
@@ -191,6 +202,14 @@ interface DrawState extends LatestRenderData {
   height: number;
   now: number;
   measuredFps: number;
+}
+
+interface BodyRenderEntry {
+  body: CelestialBody;
+  dynamics?: BodyDynamics;
+  geometry: BodyGeometry;
+  index: number;
+  logMass: number;
 }
 
 export default function UniverseCanvas({
@@ -206,6 +225,7 @@ export default function UniverseCanvas({
   hud = {},
   vectorScale = 1,
   gravityFieldDensity = 54,
+  renderFps,
   minZoom = MIN_ZOOM,
   maxZoom = MAX_ZOOM,
   interactive = true,
@@ -229,8 +249,16 @@ export default function UniverseCanvas({
   const [uncontrolledCamera, setUncontrolledCamera] = useState(DEFAULT_CAMERA);
   const [hoveredBodyId, setHoveredBodyId] = useState<string | null>(null);
   const [focused, setFocused] = useState(false);
+  const [renderFailed, setRenderFailed] = useState(false);
   const resolvedCamera = sanitizeCamera(camera ?? uncontrolledCamera);
   const cameraRef = useRef(resolvedCamera);
+  const renderRequestedRef = useRef(true);
+  const renderFailedRef = useRef(false);
+  const defaultRenderFps = hud.status?.toUpperCase() === "HOLD"
+    ? 12
+    : interactive
+      ? 60
+      : 24;
 
   const latestRenderData: LatestRenderData = {
     bodies,
@@ -245,9 +273,13 @@ export default function UniverseCanvas({
     hud,
     vectorScale,
     gravityFieldDensity,
+    renderFps: clamp(
+      finitePositive(renderFps ?? defaultRenderFps, defaultRenderFps),
+      MIN_RENDER_FPS,
+      MAX_RENDER_FPS,
+    ),
     canDragVelocity: Boolean(interactive && onVelocityChange),
   };
-  latestRenderData.display = { ...DEFAULT_DISPLAY, ...display };
   latestRenderData.referenceFrame = sanitizeReferenceFrame(referenceFrame);
   latestRenderData.vectorScale = finitePositive(vectorScale, 1);
   latestRenderData.gravityFieldDensity = clamp(
@@ -259,6 +291,9 @@ export default function UniverseCanvas({
 
   useEffect(() => {
     cameraRef.current = resolvedCamera;
+    if (latestRef.current.renderFps !== latestRenderData.renderFps) {
+      renderRequestedRef.current = true;
+    }
     latestRef.current = latestRenderData;
   });
 
@@ -276,12 +311,14 @@ export default function UniverseCanvas({
       pixelsPerMeter: clamp(nextCamera.pixelsPerMeter, low, high),
     });
     cameraRef.current = next;
+    renderRequestedRef.current = true;
     if (camera === undefined) setUncontrolledCamera(next);
     onCameraChange?.(next);
   }
 
   function updateHovered(nextId: string | null) {
     if (nextId === hoveredBodyId) return;
+    renderRequestedRef.current = true;
     setHoveredBodyId(nextId);
     onHoverBodyChange?.(nextId);
   }
@@ -294,6 +331,7 @@ export default function UniverseCanvas({
   function handlePointerDown(event: ReactPointerEvent<HTMLCanvasElement>) {
     if (!interactive) return;
     if (event.button !== 0 && event.button !== 1) return;
+    renderRequestedRef.current = true;
     const canvas = event.currentTarget;
     const point = pointerCoordinates(event);
     const handle = geometryRef.current.velocityHandle;
@@ -381,6 +419,7 @@ export default function UniverseCanvas({
       return;
     }
 
+    renderRequestedRef.current = true;
     if (drag.mode === "pan") {
       const zoom = cameraRef.current.pixelsPerMeter;
       publishCamera({
@@ -418,6 +457,7 @@ export default function UniverseCanvas({
 
   function endPointerInteraction(event: ReactPointerEvent<HTMLCanvasElement>) {
     if (dragRef.current?.pointerId !== event.pointerId) return;
+    renderRequestedRef.current = true;
     dragRef.current = null;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
@@ -427,7 +467,6 @@ export default function UniverseCanvas({
 
   function handleWheel(event: ReactWheelEvent<HTMLCanvasElement>) {
     if (!interactive) return;
-    event.preventDefault();
     const point = pointerCoordinates(event as unknown as ReactPointerEvent<HTMLCanvasElement>);
     const before = screenToFrame(point, cameraRef.current, sizeRef.current);
     const factor = Math.exp(-event.deltaY * 0.0014);
@@ -470,6 +509,7 @@ export default function UniverseCanvas({
 
   function handleKeyDown(event: ReactKeyboardEvent<HTMLCanvasElement>) {
     if (!interactive) return;
+    renderRequestedRef.current = true;
     const cameraValue = cameraRef.current;
     const panDistance = 48 / cameraValue.pixelsPerMeter;
     let nextCenter: Vector2 | null = null;
@@ -518,13 +558,19 @@ export default function UniverseCanvas({
 
     let animationFrame = 0;
     let previousFrame = performance.now();
+    let nextRenderAt = 0;
     let smoothedFps = 60;
+    let consecutiveFailures = 0;
+    let retryNotBefore = 0;
+    let lastFailureLog = Number.NEGATIVE_INFINITY;
 
     const resize = () => {
       const rect = canvas.getBoundingClientRect();
-      const dpr = clamp(window.devicePixelRatio || 1, 1, 2.5);
       const width = Math.max(1, rect.width);
       const height = Math.max(1, rect.height);
+      const requestedDpr = clamp(window.devicePixelRatio || 1, 1, 2.5);
+      const budgetDpr = Math.sqrt(MAX_CANVAS_PIXELS / (width * height));
+      const dpr = Math.max(0.25, Math.min(requestedDpr, budgetDpr));
       const pixelWidth = Math.max(1, Math.round(width * dpr));
       const pixelHeight = Math.max(1, Math.round(height * dpr));
       if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
@@ -532,6 +578,7 @@ export default function UniverseCanvas({
         canvas.height = pixelHeight;
       }
       sizeRef.current = { width, height, dpr };
+      renderRequestedRef.current = true;
     };
 
     const observer = new ResizeObserver(resize);
@@ -539,20 +586,71 @@ export default function UniverseCanvas({
     resize();
 
     const render = (now: number) => {
-      const elapsed = Math.max(1, now - previousFrame);
-      smoothedFps += ((1000 / elapsed) - smoothedFps) * 0.08;
-      previousFrame = now;
-      const size = sizeRef.current;
-      context.setTransform(size.dpr, 0, 0, size.dpr, 0, 0);
-      geometryRef.current = drawUniverse(context, {
-        ...latestRef.current,
-        camera: cameraRef.current,
-        width: size.width,
-        height: size.height,
-        now,
-        measuredFps: smoothedFps,
-      });
-      animationFrame = requestAnimationFrame(render);
+      try {
+        if (document.visibilityState !== "visible") {
+          previousFrame = now;
+          nextRenderAt = now;
+          return;
+        }
+        if (now < retryNotBefore) return;
+
+        const frameInterval = 1_000 / latestRef.current.renderFps;
+        const renderRequested = renderRequestedRef.current;
+        if (
+          !renderRequested &&
+          nextRenderAt > 0 &&
+          now < nextRenderAt - 0.5
+        ) {
+          return;
+        }
+
+        const elapsed = Math.max(1, now - previousFrame);
+        smoothedFps += ((1000 / elapsed) - smoothedFps) * 0.08;
+        previousFrame = now;
+        renderRequestedRef.current = false;
+        if (renderRequested || nextRenderAt <= 0 || now - nextRenderAt > frameInterval * 3) {
+          nextRenderAt = now + frameInterval;
+        } else {
+          do nextRenderAt += frameInterval;
+          while (nextRenderAt <= now + 0.5);
+        }
+
+        const size = sizeRef.current;
+        context.setTransform(size.dpr, 0, 0, size.dpr, 0, 0);
+        geometryRef.current = drawUniverse(context, {
+          ...latestRef.current,
+          camera: cameraRef.current,
+          width: size.width,
+          height: size.height,
+          now,
+          measuredFps: smoothedFps,
+        });
+
+        consecutiveFailures = 0;
+        retryNotBefore = 0;
+        if (renderFailedRef.current) {
+          renderFailedRef.current = false;
+          setRenderFailed(false);
+        }
+      } catch (error) {
+        consecutiveFailures += 1;
+        const retryDelay = Math.min(
+          MAX_RENDER_RETRY_DELAY,
+          250 * 2 ** Math.min(consecutiveFailures - 1, 3),
+        );
+        retryNotBefore = now + retryDelay;
+        nextRenderAt = retryNotBefore;
+        if (now - lastFailureLog >= RENDER_FAILURE_LOG_INTERVAL) {
+          lastFailureLog = now;
+          console.error("Universe canvas draw failed; retrying automatically.", error);
+        }
+        if (!renderFailedRef.current) {
+          renderFailedRef.current = true;
+          setRenderFailed(true);
+        }
+      } finally {
+        animationFrame = requestAnimationFrame(render);
+      }
     };
 
     animationFrame = requestAnimationFrame(render);
@@ -565,6 +663,7 @@ export default function UniverseCanvas({
   return (
     <div
       className={className}
+      data-universe-canvas-status={renderFailed ? "error" : "ready"}
       style={{
         position: "relative",
         width: "100%",
@@ -596,11 +695,38 @@ export default function UniverseCanvas({
           width: "100%",
           height: "100%",
           touchAction: "none",
+          overscrollBehavior: "none",
           cursor: interactive ? "crosshair" : "default",
           outline: focused ? "1px solid #d8d8d8" : "none",
           outlineOffset: -2,
         }}
       />
+      {renderFailed && (
+        <div
+          className="universe-canvas-error"
+          data-universe-canvas-error="active"
+          role="alert"
+          aria-live="assertive"
+          aria-atomic="true"
+          style={{
+            position: "absolute",
+            left: 12,
+            bottom: 12,
+            zIndex: 3,
+            maxWidth: 310,
+            padding: "8px 10px",
+            border: "1px solid rgba(255,255,255,0.46)",
+            background: "rgba(2,2,2,0.9)",
+            color: "rgba(255,255,255,0.86)",
+            font: "10px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace",
+            letterSpacing: "0.06em",
+            pointerEvents: "none",
+          }}
+        >
+          <strong style={{ display: "block", color: "#fff" }}>CANVAS RECOVERY</strong>
+          <span>Visualization paused briefly. Retrying automatically.</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -613,14 +739,20 @@ function drawUniverse(context: CanvasRenderingContext2D, state: DrawState): Rend
   context.lineCap = "round";
   context.lineJoin = "round";
 
-  if (state.display.gravityField) drawGravityField(context, state);
-  if (state.display.grid) drawGrid(context, state);
-  if (state.display.predictions) drawPredictions(context, state);
-  if (state.display.trails) drawTrails(context, state);
-  if (state.display.distanceGuides) drawDistanceGuides(context, state);
-
   const dynamicsByBody = new Map(state.dynamics.map((entry) => [entry.bodyId, entry]));
-  const bodyGeometry = state.bodies.map((body) => {
+  const logMasses = state.bodies.map((body) => Math.log10(Math.max(body.mass, 1)));
+  let minimumLogMass = Number.POSITIVE_INFINITY;
+  let maximumLogMass = Number.NEGATIVE_INFINITY;
+  for (const logMass of logMasses) {
+    minimumLogMass = Math.min(minimumLogMass, logMass);
+    maximumLogMass = Math.max(maximumLogMass, logMass);
+  }
+  if (!Number.isFinite(minimumLogMass) || !Number.isFinite(maximumLogMass)) {
+    minimumLogMass = 0;
+    maximumLogMass = 0;
+  }
+
+  const bodyEntries: BodyRenderEntry[] = state.bodies.map((body, index) => {
     const screen = absoluteToScreen(
       body.position,
       state.camera,
@@ -628,12 +760,47 @@ function drawUniverse(context: CanvasRenderingContext2D, state: DrawState): Rend
       state,
     );
     return {
-      id: body.id,
-      x: screen.x,
-      y: screen.y,
-      radius: visualBodyRadius(body, state),
+      body,
+      dynamics: dynamicsByBody.get(body.id),
+      geometry: {
+        id: body.id,
+        x: screen.x,
+        y: screen.y,
+        radius: visualBodyRadius(body, state, minimumLogMass, maximumLogMass),
+      },
+      index: index + 1,
+      logMass: logMasses[index],
     };
   });
+  const entryById = new Map(bodyEntries.map((entry) => [entry.body.id, entry]));
+  const bodyGeometry = bodyEntries.map((entry) => entry.geometry);
+
+  let maximumSpeed = 1e-30;
+  let maximumAcceleration = 1e-30;
+  for (const entry of bodyEntries) {
+    maximumSpeed = Math.max(
+      maximumSpeed,
+      Math.hypot(
+        entry.body.velocity.x - state.referenceFrame.velocity.x,
+        entry.body.velocity.y - state.referenceFrame.velocity.y,
+      ),
+    );
+    const acceleration = entry.dynamics?.acceleration ?? entry.body.acceleration;
+    maximumAcceleration = Math.max(
+      maximumAcceleration,
+      Math.hypot(acceleration.x, acceleration.y),
+    );
+  }
+
+  if (state.display.gravityField) {
+    drawGravityField(context, state, bodyEntries, maximumLogMass);
+  }
+  if (state.display.grid) drawGrid(context, state);
+  if (state.display.predictions) drawPredictions(context, state);
+  if (state.display.trails) drawTrails(context, state, entryById);
+  if (state.display.distanceGuides) {
+    drawDistanceGuides(context, state, bodyEntries, entryById);
+  }
 
   let velocityHandle: VelocityHandleGeometry | null = null;
   if (
@@ -642,34 +809,33 @@ function drawUniverse(context: CanvasRenderingContext2D, state: DrawState): Rend
       state.display.accelerationVectors ||
       state.display.forceVectors)
   ) {
-    const selectedBody = state.bodies.find((body) => body.id === state.selectedBodyId);
-    const selectedGeometry = bodyGeometry.find((body) => body.id === state.selectedBodyId);
-    if (selectedBody && selectedGeometry) {
+    const selectedEntry = entryById.get(state.selectedBodyId);
+    if (selectedEntry) {
       velocityHandle = drawVectors(
         context,
         state,
-        selectedBody,
-        selectedGeometry,
-        dynamicsByBody.get(selectedBody.id),
+        selectedEntry.body,
+        selectedEntry.geometry,
+        selectedEntry.dynamics,
+        maximumSpeed,
+        maximumAcceleration,
       );
     }
   }
 
-  for (const body of state.bodies) {
-    const geometry = bodyGeometry.find((candidate) => candidate.id === body.id);
-    if (!geometry) continue;
+  for (const entry of bodyEntries) {
     drawBody(
       context,
-      body,
-      geometry,
-      body.id === state.selectedBodyId,
-      body.id === state.hoveredBodyId,
+      entry.body,
+      entry.geometry,
+      entry.body.id === state.selectedBodyId,
+      entry.body.id === state.hoveredBodyId,
       state.now,
     );
   }
 
   if (state.display.labels || state.hoveredBodyId || state.selectedBodyId) {
-    drawBodyLabels(context, state, bodyGeometry);
+    drawBodyLabels(context, state, bodyEntries);
   }
   if (state.display.scaleIndicator) drawScaleIndicator(context, state);
   if (state.display.engineHud) drawEngineHud(context, state);
@@ -691,13 +857,25 @@ function drawGrid(context: CanvasRenderingContext2D, state: DrawState) {
   context.lineWidth = 1;
   context.strokeStyle = "rgba(255,255,255,0.055)";
   context.beginPath();
-  for (let x = Math.ceil(left / minorStep) * minorStep; x <= right; x += minorStep) {
+  const firstX = Math.ceil(left / minorStep) * minorStep;
+  const verticalLineCount = Number.isFinite(firstX)
+    ? Math.min(MAX_GRID_LINES_PER_AXIS, Math.max(0, Math.ceil((right - firstX) / minorStep) + 1))
+    : 0;
+  for (let index = 0; index < verticalLineCount; index += 1) {
+    const x = firstX + index * minorStep;
     const screenX = state.width / 2 + (x - state.camera.center.x) * zoom;
+    if (!Number.isFinite(screenX)) continue;
     context.moveTo(Math.round(screenX) + 0.5, 0);
     context.lineTo(Math.round(screenX) + 0.5, state.height);
   }
-  for (let y = Math.ceil(bottom / minorStep) * minorStep; y <= top; y += minorStep) {
+  const firstY = Math.ceil(bottom / minorStep) * minorStep;
+  const horizontalLineCount = Number.isFinite(firstY)
+    ? Math.min(MAX_GRID_LINES_PER_AXIS, Math.max(0, Math.ceil((top - firstY) / minorStep) + 1))
+    : 0;
+  for (let index = 0; index < horizontalLineCount; index += 1) {
+    const y = firstY + index * minorStep;
     const screenY = state.height / 2 - (y - state.camera.center.y) * zoom;
+    if (!Number.isFinite(screenY)) continue;
     context.moveTo(0, Math.round(screenY) + 0.5);
     context.lineTo(state.width, Math.round(screenY) + 0.5);
   }
@@ -719,38 +897,34 @@ function drawGrid(context: CanvasRenderingContext2D, state: DrawState) {
   context.restore();
 }
 
-function drawGravityField(context: CanvasRenderingContext2D, state: DrawState) {
-  if (state.bodies.length === 0) return;
-  const screenBodies = state.bodies.map((body) => ({
-    body,
-    screen: absoluteToScreen(
-      body.position,
-      state.camera,
-      state.referenceFrame,
-      state,
-    ),
-  }));
-  const largestLogMass = Math.max(
-    ...state.bodies.map((body) => Math.log10(Math.max(body.mass, 1))),
-  );
+function drawGravityField(
+  context: CanvasRenderingContext2D,
+  state: DrawState,
+  bodyEntries: readonly BodyRenderEntry[],
+  largestLogMass: number,
+) {
+  if (bodyEntries.length === 0) return;
+  const weightedBodies = bodyEntries.map((entry) => {
+    const absoluteStrength = clamp((entry.logMass - 17) / 14, 0.12, 1);
+    const relativeStrength = 10 ** clamp(entry.logMass - largestLogMass, -4, 0);
+    return {
+      entry,
+      fieldWeight: 10 ** clamp(entry.logMass - largestLogMass, -7, 0),
+      strength: clamp(absoluteStrength * 0.7 + relativeStrength * 0.3, 0.12, 1),
+    };
+  });
 
   context.save();
   context.lineWidth = 0.7;
-  for (const { body, screen } of screenBodies) {
-    if (!isNearViewport(screen.x, screen.y, 220, state)) continue;
-    const absoluteStrength = clamp((Math.log10(Math.max(body.mass, 1)) - 17) / 14, 0.12, 1);
-    const relativeStrength = 10 ** clamp(
-      Math.log10(Math.max(body.mass, 1)) - largestLogMass,
-      -4,
-      0,
-    );
-    const strength = clamp(absoluteStrength * 0.7 + relativeStrength * 0.3, 0.12, 1);
+  for (const { entry, strength } of weightedBodies) {
+    const { x, y } = entry.geometry;
+    if (!isNearViewport(x, y, 220, state)) continue;
     const contourCount = 2 + Math.round(strength * 5);
     context.strokeStyle = `rgba(255,255,255,${0.018 + strength * 0.025})`;
     for (let index = 1; index <= contourCount; index += 1) {
       const radius = (15 + index * 18) * (0.55 + strength * 0.65);
       context.beginPath();
-      context.arc(screen.x, screen.y, radius, 0, TWO_PI);
+      context.arc(x, y, radius, 0, TWO_PI);
       context.stroke();
     }
   }
@@ -762,18 +936,13 @@ function drawGravityField(context: CanvasRenderingContext2D, state: DrawState) {
     for (let x = spacing / 2; x < state.width; x += spacing) {
       let fieldX = 0;
       let fieldY = 0;
-      for (const { body, screen } of screenBodies) {
-        const dx = screen.x - x;
-        const dy = screen.y - y;
+      for (const { entry, fieldWeight } of weightedBodies) {
+        const dx = entry.geometry.x - x;
+        const dy = entry.geometry.y - y;
         const distanceSquared = dx * dx + dy * dy + 144;
-        const weight = 10 ** clamp(
-          Math.log10(Math.max(body.mass, 1)) - largestLogMass,
-          -7,
-          0,
-        );
         const inverseDistance = 1 / Math.sqrt(distanceSquared);
-        fieldX += dx * inverseDistance * weight / distanceSquared;
-        fieldY += dy * inverseDistance * weight / distanceSquared;
+        fieldX += dx * inverseDistance * fieldWeight / distanceSquared;
+        fieldY += dy * inverseDistance * fieldWeight / distanceSquared;
       }
       const magnitude = Math.hypot(fieldX, fieldY);
       if (magnitude <= 1e-12) continue;
@@ -790,6 +959,11 @@ function drawGravityField(context: CanvasRenderingContext2D, state: DrawState) {
 }
 
 function drawPredictions(context: CanvasRenderingContext2D, state: DrawState) {
+  const zoom = state.camera.pixelsPerMeter;
+  const centerX = state.width / 2;
+  const centerY = state.height / 2;
+  const frameX = state.referenceFrame.origin.x + state.camera.center.x;
+  const frameY = state.referenceFrame.origin.y + state.camera.center.y;
   context.save();
   context.setLineDash([5, 7]);
   context.lineWidth = 0.85;
@@ -801,26 +975,42 @@ function drawPredictions(context: CanvasRenderingContext2D, state: DrawState) {
         : "rgba(255,255,255,0.16)";
     context.beginPath();
     trajectory.points.forEach((point, index) => {
-      const screen = absoluteToScreen(
-        point.position,
-        state.camera,
-        state.referenceFrame,
-        state,
-      );
-      if (index === 0) context.moveTo(screen.x, screen.y);
-      else context.lineTo(screen.x, screen.y);
+      const screenX = centerX + (point.position.x - frameX) * zoom;
+      const screenY = centerY - (point.position.y - frameY) * zoom;
+      if (index === 0) context.moveTo(screenX, screenY);
+      else context.lineTo(screenX, screenY);
     });
     context.stroke();
   }
   context.restore();
 }
 
-function drawTrails(context: CanvasRenderingContext2D, state: DrawState) {
-  const bodyById = new Map(state.bodies.map((body) => [body.id, body]));
+function drawTrails(
+  context: CanvasRenderingContext2D,
+  state: DrawState,
+  entryById: ReadonlyMap<string, BodyRenderEntry>,
+) {
+  let visibleVertexCount = 0;
+  for (const trail of state.trails) {
+    const body = entryById.get(trail.bodyId)?.body;
+    if (body && !body.trailVisible) continue;
+    if (trail.points.length >= 2) visibleVertexCount += trail.points.length;
+  }
+  const stride = Math.max(
+    1,
+    Math.ceil(visibleVertexCount / MAX_VISIBLE_TRAIL_VERTICES),
+  );
+  const zoom = state.camera.pixelsPerMeter;
+  const centerX = state.width / 2;
+  const centerY = state.height / 2;
+  const frameX = state.referenceFrame.origin.x + state.camera.center.x;
+  const frameY = state.referenceFrame.origin.y + state.camera.center.y;
+  const discontinuityThreshold = Math.max(state.width, state.height) ** 2;
+
   context.save();
   context.lineWidth = 0.9;
   for (const trail of state.trails) {
-    const body = bodyById.get(trail.bodyId);
+    const body = entryById.get(trail.bodyId)?.body;
     if (body && !body.trailVisible) continue;
     if (trail.points.length < 2) continue;
     const selected = trail.bodyId === state.selectedBodyId;
@@ -829,51 +1019,57 @@ function drawTrails(context: CanvasRenderingContext2D, state: DrawState) {
       : "rgba(255,255,255,0.28)";
     context.beginPath();
     let started = false;
-    let previous: Vector2 | null = null;
-    for (const point of trail.points) {
-      const screen = absoluteToScreen(
-        point,
-        state.camera,
-        state.referenceFrame,
-        state,
-      );
-      const discontinuity = previous
-        ? squaredDistance(previous.x, previous.y, screen.x, screen.y) >
-          Math.max(state.width, state.height) ** 2
-        : false;
-      if (!started || discontinuity) context.moveTo(screen.x, screen.y);
-      else context.lineTo(screen.x, screen.y);
+    let previousX = 0;
+    let previousY = 0;
+    const lastIndex = trail.points.length - 1;
+    for (let index = 0; index <= lastIndex; index += stride) {
+      const point = trail.points[index];
+      const screenX = centerX + (point.x - frameX) * zoom;
+      const screenY = centerY - (point.y - frameY) * zoom;
+      const discontinuity = started &&
+        squaredDistance(previousX, previousY, screenX, screenY) > discontinuityThreshold;
+      if (!started || discontinuity) context.moveTo(screenX, screenY);
+      else context.lineTo(screenX, screenY);
       started = true;
-      previous = screen;
+      previousX = screenX;
+      previousY = screenY;
+    }
+    if (lastIndex % stride !== 0) {
+      const point = trail.points[lastIndex];
+      const screenX = centerX + (point.x - frameX) * zoom;
+      const screenY = centerY - (point.y - frameY) * zoom;
+      const discontinuity = started &&
+        squaredDistance(previousX, previousY, screenX, screenY) > discontinuityThreshold;
+      if (!started || discontinuity) context.moveTo(screenX, screenY);
+      else context.lineTo(screenX, screenY);
     }
     context.stroke();
   }
   context.restore();
 }
 
-function drawDistanceGuides(context: CanvasRenderingContext2D, state: DrawState) {
-  const selected = state.bodies.find((body) => body.id === state.selectedBodyId);
-  if (!selected) return;
-  const start = absoluteToScreen(
-    selected.position,
-    state.camera,
-    state.referenceFrame,
-    state,
-  );
+function drawDistanceGuides(
+  context: CanvasRenderingContext2D,
+  state: DrawState,
+  bodyEntries: readonly BodyRenderEntry[],
+  entryById: ReadonlyMap<string, BodyRenderEntry>,
+) {
+  const selectedEntry = state.selectedBodyId
+    ? entryById.get(state.selectedBodyId)
+    : undefined;
+  if (!selectedEntry) return;
+  const selected = selectedEntry.body;
+  const start = selectedEntry.geometry;
   context.save();
   context.lineWidth = 0.6;
   context.setLineDash([2, 6]);
   context.font = "9px ui-monospace, SFMono-Regular, Consolas, monospace";
   context.textAlign = "center";
   context.textBaseline = "bottom";
-  for (const body of state.bodies) {
+  for (const entry of bodyEntries) {
+    const body = entry.body;
     if (body.id === selected.id) continue;
-    const end = absoluteToScreen(
-      body.position,
-      state.camera,
-      state.referenceFrame,
-      state,
-    );
+    const end = entry.geometry;
     if (
       !isNearViewport(start.x, start.y, 40, state) &&
       !isNearViewport(end.x, end.y, 40, state)
@@ -909,31 +1105,16 @@ function drawVectors(
   body: CelestialBody,
   geometry: BodyGeometry,
   dynamics?: BodyDynamics,
+  maximumSpeed = 1e-30,
+  maximumAcceleration = 1e-30,
 ): VelocityHandleGeometry | null {
   const relativeVelocity = {
     x: body.velocity.x - state.referenceFrame.velocity.x,
     y: body.velocity.y - state.referenceFrame.velocity.y,
   };
   const acceleration = dynamics?.acceleration ?? body.acceleration;
-  const maxSpeed = Math.max(
-    1e-30,
-    ...state.bodies.map((candidate) =>
-      Math.hypot(
-        candidate.velocity.x - state.referenceFrame.velocity.x,
-        candidate.velocity.y - state.referenceFrame.velocity.y,
-      ),
-    ),
-  );
-  const maxAcceleration = Math.max(
-    1e-30,
-    ...state.bodies.map((candidate) => {
-      const candidateDynamics = state.dynamics.find((entry) => entry.bodyId === candidate.id);
-      const value = candidateDynamics?.acceleration ?? candidate.acceleration;
-      return Math.hypot(value.x, value.y);
-    }),
-  );
-  const velocityPixelsPerUnit = (82 / maxSpeed) * state.vectorScale;
-  const accelerationPixelsPerUnit = (58 / maxAcceleration) * state.vectorScale;
+  const velocityPixelsPerUnit = (82 / maximumSpeed) * state.vectorScale;
+  const accelerationPixelsPerUnit = (58 / maximumAcceleration) * state.vectorScale;
   let velocityHandle: VelocityHandleGeometry | null = null;
 
   context.save();
@@ -1114,25 +1295,29 @@ function drawBody(
 function drawBodyLabels(
   context: CanvasRenderingContext2D,
   state: DrawState,
-  geometry: readonly BodyGeometry[],
+  bodyEntries: readonly BodyRenderEntry[],
 ) {
   const occupied: Rect[] = [];
-  const bodyIndex = new Map(state.bodies.map((body, index) => [body.id, index + 1]));
-  const ordered = [...state.bodies].sort((a, b) => {
-    const score = (body: CelestialBody) =>
-      body.id === state.selectedBodyId ? 2 : body.id === state.hoveredBodyId ? 1 : 0;
+  const ordered = [...bodyEntries].sort((a, b) => {
+    const score = (entry: BodyRenderEntry) =>
+      entry.body.id === state.selectedBodyId
+        ? 2
+        : entry.body.id === state.hoveredBodyId
+          ? 1
+          : 0;
     return score(b) - score(a);
   });
   context.save();
   context.font = "9px ui-monospace, SFMono-Regular, Consolas, monospace";
   context.textBaseline = "top";
 
-  for (const body of ordered) {
+  for (const entry of ordered) {
+    const body = entry.body;
     const selected = body.id === state.selectedBodyId;
     const hovered = body.id === state.hoveredBodyId;
     if (!state.display.labels && !selected && !hovered) continue;
-    const screenBody = geometry.find((candidate) => candidate.id === body.id);
-    if (!screenBody || !isNearViewport(screenBody.x, screenBody.y, 170, state)) continue;
+    const screenBody = entry.geometry;
+    if (!isNearViewport(screenBody.x, screenBody.y, 170, state)) continue;
     const width = hovered || selected ? 142 : 128;
     const height = hovered || selected ? 43 : 31;
     const candidates: Rect[] = [
@@ -1176,7 +1361,7 @@ function drawBodyLabels(
     context.fillRect(label.x - 4, label.y - 3, label.width + 8, label.height + 6);
     context.fillStyle = selected ? "#ffffff" : "rgba(255,255,255,0.82)";
     context.fillText(
-      `${body.name.toUpperCase()} / BODY ${String(bodyIndex.get(body.id) ?? 0).padStart(2, "0")}`,
+      `${body.name.toUpperCase()} / BODY ${String(entry.index).padStart(2, "0")}`,
       label.x,
       label.y,
     );
@@ -1300,10 +1485,12 @@ function screenToAbsolute(
   };
 }
 
-function visualBodyRadius(body: CelestialBody, state: DrawState) {
-  const logMasses = state.bodies.map((candidate) => Math.log10(Math.max(candidate.mass, 1)));
-  const minMass = Math.min(...logMasses);
-  const maxMass = Math.max(...logMasses);
+function visualBodyRadius(
+  body: CelestialBody,
+  state: DrawState,
+  minMass: number,
+  maxMass: number,
+) {
   const normalizedMass =
     maxMass > minMass
       ? (Math.log10(Math.max(body.mass, 1)) - minMass) / (maxMass - minMass)
@@ -1341,10 +1528,18 @@ function selectAdjacentBody(
 function sanitizeCamera(camera: UniverseCamera): UniverseCamera {
   return {
     center: {
-      x: Number.isFinite(camera.center.x) ? camera.center.x : 0,
-      y: Number.isFinite(camera.center.y) ? camera.center.y : 0,
+      x: Number.isFinite(camera.center.x)
+        ? clamp(camera.center.x, -MAX_CAMERA_COORDINATE, MAX_CAMERA_COORDINATE)
+        : 0,
+      y: Number.isFinite(camera.center.y)
+        ? clamp(camera.center.y, -MAX_CAMERA_COORDINATE, MAX_CAMERA_COORDINATE)
+        : 0,
     },
-    pixelsPerMeter: finitePositive(camera.pixelsPerMeter, DEFAULT_CAMERA.pixelsPerMeter),
+    pixelsPerMeter: clamp(
+      finitePositive(camera.pixelsPerMeter, DEFAULT_CAMERA.pixelsPerMeter),
+      MIN_ZOOM,
+      MAX_ZOOM,
+    ),
   };
 }
 

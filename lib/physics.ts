@@ -361,11 +361,13 @@ export function calculateBodyDynamics(
     }
   }
 
-  return bodies.map((body, index) => ({
-    bodyId: body.id,
-    acceleration: { ...accelerations[index] },
-    netForce: scaleVector(accelerations[index], body.mass),
-  }));
+  return bodies.map((body, index) => {
+    const acceleration = { ...accelerations[index] };
+    const netForce = scaleVector(acceleration, body.mass);
+    assertFiniteVector(acceleration, `Acceleration for ${body.id}`);
+    assertFiniteVector(netForce, `Net force for ${body.id}`);
+    return { bodyId: body.id, acceleration, netForce };
+  });
 }
 
 export function calculateAccelerations(
@@ -428,29 +430,35 @@ export function forceVectorsOnBody(
   bodyId: string,
   config: Partial<PhysicsConfig> = {},
 ): ForceVector[] {
+  const { gravitationalConstant, softening } = resolvePhysicsConfig(config);
+  validateBodiesForCalculation(bodies);
   const selected = bodies.find((body) => body.id === bodyId);
   if (!selected) throw new Error(`Unknown body id: ${bodyId}`);
+  const softeningSquared = softening * softening;
 
-  return calculatePairwiseForces(bodies, config).flatMap((pair) => {
-    if (pair.bodyAId === bodyId) {
-      return [{
-        sourceBodyId: bodyId,
-        attractingBodyId: pair.bodyBId,
-        distance: pair.distance,
-        magnitude: pair.magnitude,
-        vector: { ...pair.forceOnA },
-      }];
+  return bodies.flatMap((attractingBody) => {
+    if (attractingBody.id === bodyId) return [];
+    const displacement = subtractVectors(attractingBody.position, selected.position);
+    const distanceSquared = vectorMagnitudeSquared(displacement);
+    const softenedDistanceSquared = distanceSquared + softeningSquared;
+    let vector = { x: 0, y: 0 };
+
+    if (softenedDistanceSquared > EPSILON) {
+      const inverseDistance = 1 / Math.sqrt(softenedDistanceSquared);
+      const scalar = gravitationalConstant
+        * selected.mass
+        * attractingBody.mass
+        * (inverseDistance / softenedDistanceSquared);
+      vector = scaleVector(displacement, scalar);
     }
-    if (pair.bodyBId === bodyId) {
-      return [{
-        sourceBodyId: bodyId,
-        attractingBodyId: pair.bodyAId,
-        distance: pair.distance,
-        magnitude: pair.magnitude,
-        vector: { ...pair.forceOnB },
-      }];
-    }
-    return [];
+
+    return [{
+      sourceBodyId: bodyId,
+      attractingBodyId: attractingBody.id,
+      distance: Math.sqrt(distanceSquared),
+      magnitude: vectorMagnitude(vector),
+      vector,
+    }];
   });
 }
 
@@ -524,6 +532,8 @@ export function advanceSimulation(
       acceleration: { ...acceleration },
     };
   });
+  validateBodiesForCalculation(finalBodies);
+  validateUniqueIds(finalBodies);
 
   return {
     state: {
@@ -547,25 +557,33 @@ export function stepSimulation(
 
 /**
  * Advances an arbitrary duration using fixed substeps no larger than maxStep.
- * This is useful when a UI changes time scale without degrading integration.
+ * Work is capped so an accidental duration/timestep mismatch cannot lock an
+ * interactive renderer. Any duration beyond the cap is deliberately dropped.
  */
 export function simulateDuration(
   state: SimulationState,
   duration: number,
   maxStep = state.config.timeStep,
+  maxSubsteps = 512,
+  collectCollisionEvents = true,
 ): SimulationStepResult {
   assertFiniteNonNegative(duration, "Simulation duration");
   assertFinitePositive(maxStep, "Maximum integration step");
+  if (!Number.isInteger(maxSubsteps) || maxSubsteps < 1) {
+    throw new RangeError("Simulation maxSubsteps must be a positive integer.");
+  }
   let nextState = cloneSimulationState(state);
   const collisions: CollisionEvent[] = [];
   let remaining = duration;
+  let completedSubsteps = 0;
 
-  while (remaining > EPSILON) {
+  while (remaining > EPSILON && completedSubsteps < maxSubsteps) {
     const dt = Math.min(maxStep, remaining);
     const result = advanceSimulation(nextState, dt);
     nextState = result.state;
-    collisions.push(...result.collisions);
+    if (collectCollisionEvents) collisions.push(...result.collisions);
     remaining -= dt;
+    completedSubsteps += 1;
   }
 
   return { state: nextState, collisions };
@@ -579,6 +597,8 @@ export function refreshAccelerations(state: SimulationState): SimulationState {
     ...body,
     acceleration: { ...(accelerations.get(body.id) ?? ZERO) },
   }));
+  validateBodiesForCalculation(cloned.bodies);
+  validateUniqueIds(cloned.bodies);
   return cloned;
 }
 
@@ -755,7 +775,6 @@ export function predictTrajectories(
     requestedStep,
     options.horizon / maxSteps,
   );
-  const startTime = state.time;
   let predicted = cloneSimulationState(state);
   if (options.collisionMode) {
     predicted.config.collisionMode = options.collisionMode;
@@ -778,15 +797,20 @@ export function predictTrajectories(
   if (options.includeInitial ?? true) sample(0);
   let elapsed = 0;
   let nextSample = sampleInterval;
+  let completedSteps = 0;
 
-  while (elapsed < options.horizon - EPSILON) {
-    const dt = Math.min(integrationStep, options.horizon - elapsed);
+  while (elapsed < options.horizon - EPSILON && completedSteps < maxSteps) {
+    const remaining = options.horizon - elapsed;
+    const finalAllowedStep = completedSteps === maxSteps - 1;
+    const dt = finalAllowedStep ? remaining : Math.min(integrationStep, remaining);
     predicted = stepSimulation(predicted, dt);
-    elapsed = predicted.time - startTime;
+    elapsed = finalAllowedStep ? options.horizon : elapsed + dt;
+    completedSteps += 1;
 
     if (elapsed + EPSILON >= nextSample || elapsed + EPSILON >= options.horizon) {
       sample(elapsed);
-      while (nextSample <= elapsed + EPSILON) nextSample += sampleInterval;
+      const intervalsPassed = Math.floor((elapsed + EPSILON - nextSample) / sampleInterval) + 1;
+      nextSample += Math.max(1, intervalsPassed) * sampleInterval;
     }
   }
 
@@ -862,15 +886,20 @@ function resolveElasticCollisions(
   let elapsedTime = 0;
   let remainingTime = deltaTime;
   let resolvedCollisionCount = 0;
+  const resolvedAtCurrentTime = new Set<string>();
   // Degenerate contact piles can otherwise create an unbounded amount of work
   // in one UI tick. Normal systems terminate far below this guard.
-  const maxResolvedCollisions = Math.max(64, bodies.length * bodies.length * 2);
+  const maxResolvedCollisions = Math.min(16, Math.max(8, Math.ceil(bodies.length / 2)));
 
   while (
     remainingTime > EPSILON &&
     resolvedCollisionCount < maxResolvedCollisions
   ) {
-    const candidate = findEarliestElasticCollision(bodies, remainingTime);
+    const candidate = findEarliestElasticCollision(
+      bodies,
+      remainingTime,
+      resolvedAtCurrentTime,
+    );
     if (!candidate) {
       advanceBodiesLinearly(bodies, remainingTime);
       elapsedTime += remainingTime;
@@ -882,6 +911,7 @@ function resolveElasticCollisions(
       remainingTime,
       Math.max(0, candidate.time),
     );
+    if (timeToImpact > EPSILON) resolvedAtCurrentTime.clear();
     advanceBodiesLinearly(bodies, timeToImpact);
     elapsedTime += timeToImpact;
     remainingTime = Math.max(0, remainingTime - timeToImpact);
@@ -941,6 +971,7 @@ function resolveElasticCollisions(
       impactSpeed,
       time: startTime + elapsedTime,
     });
+    resolvedAtCurrentTime.add(candidate.pairKey);
     resolvedCollisionCount += 1;
   }
 
@@ -954,6 +985,7 @@ function resolveElasticCollisions(
 function findEarliestElasticCollision(
   bodies: readonly CelestialBody[],
   remainingTime: number,
+  resolvedAtCurrentTime: ReadonlySet<string> = new Set(),
 ): ElasticCollisionCandidate | null {
   let earliest: ElasticCollisionCandidate | null = null;
   const timeTolerance = Math.max(
@@ -987,6 +1019,9 @@ function findEarliestElasticCollision(
 
       const candidateTime = collision.timeFraction * remainingTime;
       const pairKey = collisionPairKey(bodyA.id, bodyB.id);
+      if (candidateTime <= timeTolerance && resolvedAtCurrentTime.has(pairKey)) {
+        continue;
+      }
       if (
         !earliest ||
         candidateTime < earliest.time - timeTolerance ||

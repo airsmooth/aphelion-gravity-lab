@@ -4,7 +4,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { MiniPlot } from "@/components/MiniPlot";
 import {
-  calculateBodyDynamics,
   calculatePairMetrics,
   calculateSystemDiagnostics,
   cloneSimulationState,
@@ -45,8 +44,50 @@ import UniverseCanvas, {
 } from "./UniverseCanvas";
 
 const TIME_SCALE_OPTIONS = [0.1, 0.25, 0.5, 1, 2, 5, 10] as const;
-const SIMULATED_SECONDS_PER_REAL_SECOND = 86_400;
+const TARGET_PHYSICS_STEPS_PER_REAL_SECOND = 60;
+const MAX_SUBSTEPS_PER_FRAME = 20;
+const MAX_PHYSICS_UPDATES_PER_SECOND = 60;
+const MAX_PRESENTATION_UPDATES_PER_SECOND = 30;
+const MAX_TRAIL_SAMPLES_PER_SECOND = 20;
 const MAX_HISTORY = 96;
+const MAX_BODIES = 32;
+const MIN_CAMERA_ZOOM = 1e-15;
+const MAX_CAMERA_ZOOM = 1e2;
+const MAX_GRAVITATIONAL_CONSTANT = 1e-5;
+const MAX_TIMESTEP = 31_557_600;
+const MAX_SOFTENING = 1e24;
+const MAX_BODY_MASS = 1e35;
+const MAX_BODY_RADIUS = 1e18;
+const MAX_BODY_DENSITY = 1e20;
+const MAX_BODY_POSITION = 1e24;
+const MAX_BODY_VELOCITY = 1e9;
+
+function clamp(value: number, minimum: number, maximum: number) {
+  return Math.max(minimum, Math.min(maximum, value));
+}
+
+function clampSigned(value: number, maximumMagnitude: number) {
+  return clamp(value, -maximumMagnitude, maximumMagnitude);
+}
+
+function sanitizeInteractiveBody(body: CelestialBody): CelestialBody {
+  return {
+    ...body,
+    mass: clamp(body.mass, 1, MAX_BODY_MASS),
+    radius: clamp(body.radius, 1, MAX_BODY_RADIUS),
+    density: body.density === undefined
+      ? undefined
+      : clamp(body.density, Number.MIN_VALUE, MAX_BODY_DENSITY),
+    position: {
+      x: clampSigned(body.position.x, MAX_BODY_POSITION),
+      y: clampSigned(body.position.y, MAX_BODY_POSITION),
+    },
+    velocity: {
+      x: clampSigned(body.velocity.x, MAX_BODY_VELOCITY),
+      y: clampSigned(body.velocity.y, MAX_BODY_VELOCITY),
+    },
+  };
+}
 
 type InspectorTab = "object" | "analysis";
 type ReferenceFrameMode = "inertial" | "center-of-mass" | "selected-body";
@@ -114,9 +155,13 @@ export default function GravityLab() {
   const [referenceFrameMode, setReferenceFrameMode] = useState<ReferenceFrameMode>("inertial");
   const [predictionSource, setPredictionSource] = useState(() => cloneSimulationState(initialSimulation));
   const [history, setHistory] = useState<HistorySample[]>([]);
+  const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
   const lastTrailTimeRef = useRef(initialSimulation.time);
+  const lastTrailWallTimeRef = useRef(0);
+  const simulatedTimeDebtRef = useRef(0);
   const bodySequenceRef = useRef(initialSimulation.bodies.length + 1);
+  const predictionRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const selectedBody = simulation.bodies.find((body) => body.id === selectedBodyId) ?? null;
   const comparisonBody = simulation.bodies.find((body) => body.id === analysisBodyId) ?? null;
@@ -137,10 +182,14 @@ export default function GravityLab() {
     }
   }, [referenceFrame, simulation.bodies]);
 
-  const dynamics = useMemo(
-    () => calculateBodyDynamics(simulation.bodies, simulation.config),
-    [simulation.bodies, simulation.config],
-  );
+  const dynamics = useMemo(() => simulation.bodies.map((body) => ({
+    bodyId: body.id,
+    acceleration: body.acceleration,
+    netForce: {
+      x: body.acceleration.x * body.mass,
+      y: body.acceleration.y * body.mass,
+    },
+  })), [simulation.bodies]);
 
   const selectedForces = useMemo(() => {
     if (!selectedBodyId || !simulation.bodies.some((body) => body.id === selectedBodyId)) return [];
@@ -160,17 +209,32 @@ export default function GravityLab() {
   const predictions = useMemo(() => {
     if (!display.predictions || predictionSource.bodies.length < 2) return [];
     const horizon = Math.max(0.02, predictionHorizonDays) * 86_400;
+    const bodyCount = predictionSource.bodies.length;
+    const maxSteps = clamp(Math.floor(8_000 / (bodyCount * bodyCount)), 32, 240);
     return predictTrajectories(predictionSource, {
       horizon,
       integrationStep: Math.max(predictionSource.config.timeStep, horizon / 220),
       sampleInterval: Math.max(predictionSource.config.timeStep, horizon / 90),
-      maxSteps: 240,
+      maxSteps,
       collisionMode: "pass",
     });
   }, [display.predictions, predictionHorizonDays, predictionSource]);
 
-  const openingInset = useMemo(() => {
+  const openingInsetTrails = useMemo(() => {
     if (activePresetId !== "sun-earth-moon") return null;
+    const earthTrail = trails.find((trail) => trail.bodyId === "earth")?.points ?? [];
+    const moonTrail = trails.find((trail) => trail.bodyId === "moon")?.points ?? [];
+    const pointCount = Math.min(earthTrail.length, moonTrail.length);
+    const relativeTrail = Array.from({ length: pointCount }, (_, index) => {
+      const earthPoint = earthTrail[earthTrail.length - pointCount + index];
+      const moonPoint = moonTrail[moonTrail.length - pointCount + index];
+      return { x: moonPoint.x - earthPoint.x, y: moonPoint.y - earthPoint.y };
+    });
+    return [{ bodyId: "moon", points: relativeTrail }];
+  }, [activePresetId, trails]);
+
+  const openingInset = useMemo(() => {
+    if (!openingInsetTrails) return null;
     const earth = simulation.bodies.find((body) => body.id === "earth");
     const moon = simulation.bodies.find((body) => body.id === "moon");
     if (!earth || !moon) return null;
@@ -179,14 +243,6 @@ export default function GravityLab() {
       y: moon.position.y - earth.position.y,
     };
     const distance = Math.max(1, Math.hypot(relative.x, relative.y));
-    const earthTrail = trails.find((trail) => trail.bodyId === earth.id)?.points ?? [];
-    const moonTrail = trails.find((trail) => trail.bodyId === moon.id)?.points ?? [];
-    const pointCount = Math.min(earthTrail.length, moonTrail.length);
-    const relativeTrail = Array.from({ length: pointCount }, (_, index) => {
-      const earthPoint = earthTrail[earthTrail.length - pointCount + index];
-      const moonPoint = moonTrail[moonTrail.length - pointCount + index];
-      return { x: moonPoint.x - earthPoint.x, y: moonPoint.y - earthPoint.y };
-    });
     return {
       bodies: [
         { ...earth, fixed: true, position: { x: 0, y: 0 }, velocity: { x: 0, y: 0 } },
@@ -196,23 +252,94 @@ export default function GravityLab() {
           velocity: { x: moon.velocity.x - earth.velocity.x, y: moon.velocity.y - earth.velocity.y },
         },
       ],
-      trails: [
-        { bodyId: earth.id, points: relativeTrail.map(() => ({ x: 0, y: 0 })) },
-        { bodyId: moon.id, points: relativeTrail },
-      ],
+      trails: openingInsetTrails,
       camera: { center: { x: 0, y: 0 }, pixelsPerMeter: 88 / distance },
     };
-  }, [activePresetId, simulation.bodies, trails]);
+  }, [openingInsetTrails, simulation.bodies]);
 
   function commitSimulation(nextState: SimulationState, refreshPrediction = false) {
+    simulatedTimeDebtRef.current = 0;
     simulationRef.current = nextState;
     setSimulation(nextState);
-    if (refreshPrediction) setPredictionSource(cloneSimulationState(nextState));
+    if (refreshPrediction) {
+      if (predictionRefreshTimerRef.current) clearTimeout(predictionRefreshTimerRef.current);
+      predictionRefreshTimerRef.current = null;
+      setPredictionSource(cloneSimulationState(nextState));
+    }
   }
 
-  const appendTrailSample = useCallback((nextState: SimulationState, force = false) => {
+  const reportRuntimeError = useCallback((error: unknown) => {
+    console.error("Aphelion operation failed", error);
+    setRuntimeError(error instanceof Error ? error.message : "The physics engine reported an unknown error.");
+    setPaused(true);
+  }, []);
+
+  function schedulePredictionRefresh(nextState: SimulationState) {
+    if (predictionRefreshTimerRef.current) clearTimeout(predictionRefreshTimerRef.current);
+    const snapshot = cloneSimulationState(nextState);
+    predictionRefreshTimerRef.current = setTimeout(() => {
+      predictionRefreshTimerRef.current = null;
+      setPredictionSource(snapshot);
+    }, 180);
+  }
+
+  useEffect(() => () => {
+    if (predictionRefreshTimerRef.current) clearTimeout(predictionRefreshTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    const parameters = new URLSearchParams(window.location.search);
+    if (parameters.get("endurance") !== "1") return;
+
+    // The packaged endurance runner uses a deterministic worst-case visual
+    // workload. It is intentionally activated only by the local test query.
+    const preset = createRandomPreset("aphelion-endurance-v1", MAX_BODIES);
+    const next = createSimulationState(preset.bodies, {
+      ...preset.config,
+      collisionMode: "pass",
+    });
+    document.documentElement.dataset.aphelionEndurance = "active";
+    const startTimer = window.setTimeout(() => {
+      resetStateRef.current = cloneSimulationState(next);
+      lastTrailTimeRef.current = next.time;
+      lastTrailWallTimeRef.current = 0;
+      simulatedTimeDebtRef.current = 0;
+      simulationRef.current = next;
+      setActivePresetId("random-system");
+      setPresetDescription("Deterministic 32-body desktop endurance workload.");
+      setSelectedBodyId(preset.focusBodyId);
+      setAnalysisBodyId(preset.bodies.find((body) => body.id !== preset.focusBodyId)?.id ?? null);
+      setCamera(cameraForPreset(preset));
+      setTrails(initialTrails(next.bodies));
+      setTrailLength(800);
+      setTrailSamplingInterval(Math.max(0.01, next.config.timeStep));
+      setGravityFieldDensity(30);
+      setDisplay((current) => ({
+        ...current,
+        grid: true,
+        trails: true,
+        gravityField: true,
+        predictions: true,
+      }));
+      setTimeScale(10);
+      setHistory([]);
+      setRuntimeError(null);
+      setPaused(false);
+      setPredictionSource(cloneSimulationState(next));
+      setSimulation(next);
+    }, 0);
+
+    return () => {
+      window.clearTimeout(startTimer);
+      delete document.documentElement.dataset.aphelionEndurance;
+    };
+  }, []);
+
+  const appendTrailSample = useCallback((nextState: SimulationState, force = false, wallTime = performance.now()) => {
     if (!force && nextState.time - lastTrailTimeRef.current < trailSamplingInterval) return;
+    if (!force && wallTime - lastTrailWallTimeRef.current < 1_000 / MAX_TRAIL_SAMPLES_PER_SECOND) return;
     lastTrailTimeRef.current = nextState.time;
+    lastTrailWallTimeRef.current = wallTime;
     setTrails((current) => {
       const existing = new Map(current.map((trail) => [trail.bodyId, trail.points]));
       return nextState.bodies
@@ -230,54 +357,114 @@ export default function GravityLab() {
     let lastHudUpdate = previous;
     let lastHistoryUpdate = previous;
     let lastPredictionUpdate = previous;
+    const physicsUpdateInterval = 1_000 / MAX_PHYSICS_UPDATES_PER_SECOND;
+    const presentationUpdateInterval = 1_000 / MAX_PRESENTATION_UPDATES_PER_SECOND;
+    let nextPhysicsUpdate = previous + physicsUpdateInterval;
+    let nextPresentationUpdate = previous + presentationUpdateInterval;
     let smoothedFps = 60;
 
     const animate = (now: number) => {
       const realDelta = Math.min(0.05, Math.max(0, (now - previous) / 1_000));
       previous = now;
+      if (document.visibilityState !== "visible") {
+        simulatedTimeDebtRef.current = 0;
+        nextPhysicsUpdate = now + physicsUpdateInterval;
+        nextPresentationUpdate = now + presentationUpdateInterval;
+        frame = requestAnimationFrame(animate);
+        return;
+      }
       if (realDelta > 0) smoothedFps += ((1 / realDelta) - smoothedFps) * 0.08;
 
       if (!paused && realDelta > 0) {
-        const current = simulationRef.current;
-        const duration = realDelta * SIMULATED_SECONDS_PER_REAL_SECOND * timeScale;
-        const next = simulateDuration(current, duration, current.config.timeStep).state;
-        simulationRef.current = next;
-        setSimulation(next);
-        appendTrailSample(next);
+        try {
+          const current = simulationRef.current;
+          simulatedTimeDebtRef.current +=
+            realDelta * current.config.timeStep * TARGET_PHYSICS_STEPS_PER_REAL_SECOND * timeScale;
 
-        if (selectedBodyId && !next.bodies.some((body) => body.id === selectedBodyId)) {
-          const fallbackId = next.bodies[0]?.id ?? null;
-          setSelectedBodyId(fallbackId);
-          setAnalysisBodyId(next.bodies.find((body) => body.id !== fallbackId)?.id ?? null);
-        } else if (
-          !analysisBodyId ||
-          analysisBodyId === selectedBodyId ||
-          !next.bodies.some((body) => body.id === analysisBodyId)
-        ) {
-          setAnalysisBodyId(next.bodies.find((body) => body.id !== selectedBodyId)?.id ?? null);
-        }
+          // Monitors can refresh at 60, 144, 240 Hz, or more. Physics should
+          // not become proportionally more expensive on a faster monitor, so
+          // consume only complete fixed steps at a capped 60 solver updates/s.
+          const requestedSteps = Math.floor(simulatedTimeDebtRef.current / current.config.timeStep);
+          const physicsUpdateDue = now + 0.5 >= nextPhysicsUpdate;
+          if (requestedSteps > 0 && physicsUpdateDue) {
+            if (now - nextPhysicsUpdate > physicsUpdateInterval * 3) {
+              nextPhysicsUpdate = now + physicsUpdateInterval;
+            } else {
+              do nextPhysicsUpdate += physicsUpdateInterval;
+              while (nextPhysicsUpdate <= now + 0.5);
+            }
+            const frameSubstepBudget = current.config.collisionMode === "elastic"
+              ? Math.min(MAX_SUBSTEPS_PER_FRAME, Math.max(2, Math.floor(192 / current.bodies.length)))
+              : MAX_SUBSTEPS_PER_FRAME;
+            const completedSteps = Math.min(requestedSteps, frameSubstepBudget);
+            simulatedTimeDebtRef.current -= completedSteps * current.config.timeStep;
+            const maximumCarriedDebt = frameSubstepBudget * current.config.timeStep;
+            if (simulatedTimeDebtRef.current > maximumCarriedDebt) {
+              // Keep at most one bounded catch-up burst. Older work is dropped
+              // so a slow frame cannot create an ever-growing render backlog.
+              const fractionalDebt = simulatedTimeDebtRef.current % current.config.timeStep;
+              simulatedTimeDebtRef.current = maximumCarriedDebt + fractionalDebt;
+            }
+            const next = simulateDuration(
+              current,
+              completedSteps * current.config.timeStep,
+              current.config.timeStep,
+              completedSteps,
+              false,
+            ).state;
+            simulationRef.current = next;
+            appendTrailSample(next, false, now);
 
-        if (now - lastHistoryUpdate >= 550) {
-          lastHistoryUpdate = now;
-          const system = calculateSystemDiagnostics(next.bodies, next.config);
-          const primary = next.bodies.find((body) => body.id === selectedBodyId);
-          const secondary = next.bodies.find((body) => body.id === analysisBodyId);
-          const pair = primary && secondary && primary.id !== secondary.id
-            ? calculatePairMetrics(primary, secondary, next.config)
-            : null;
-          setHistory((currentHistory) => [...currentHistory, {
-            distance: pair?.distance ?? 0,
-            speed: pair?.relativeSpeed ?? 0,
-            kinetic: system.kineticEnergy,
-            potential: system.potentialEnergy,
-            total: system.totalEnergy,
-          }].slice(-MAX_HISTORY));
-        }
+            if (now + 0.5 >= nextPresentationUpdate) {
+              if (now - nextPresentationUpdate > presentationUpdateInterval * 3) {
+                nextPresentationUpdate = now + presentationUpdateInterval;
+              } else {
+                do nextPresentationUpdate += presentationUpdateInterval;
+                while (nextPresentationUpdate <= now + 0.5);
+              }
+              setSimulation(next);
+            }
 
-        if (now - lastPredictionUpdate >= 1_200) {
-          lastPredictionUpdate = now;
-          setPredictionSource(cloneSimulationState(next));
+            if (selectedBodyId && !next.bodies.some((body) => body.id === selectedBodyId)) {
+              const fallbackId = next.bodies[0]?.id ?? null;
+              setSelectedBodyId(fallbackId);
+              setAnalysisBodyId(next.bodies.find((body) => body.id !== fallbackId)?.id ?? null);
+            } else if (
+              !analysisBodyId ||
+              analysisBodyId === selectedBodyId ||
+              !next.bodies.some((body) => body.id === analysisBodyId)
+            ) {
+              setAnalysisBodyId(next.bodies.find((body) => body.id !== selectedBodyId)?.id ?? null);
+            }
+
+            if (now - lastHistoryUpdate >= 550) {
+              lastHistoryUpdate = now;
+              const system = calculateSystemDiagnostics(next.bodies, next.config);
+              const primary = next.bodies.find((body) => body.id === selectedBodyId);
+              const secondary = next.bodies.find((body) => body.id === analysisBodyId);
+              const pair = primary && secondary && primary.id !== secondary.id
+                ? calculatePairMetrics(primary, secondary, next.config)
+                : null;
+              setHistory((currentHistory) => [...currentHistory, {
+                distance: pair?.distance ?? 0,
+                speed: pair?.relativeSpeed ?? 0,
+                kinetic: system.kineticEnergy,
+                potential: system.potentialEnergy,
+                total: system.totalEnergy,
+              }].slice(-MAX_HISTORY));
+            }
+
+            if (now - lastPredictionUpdate >= 1_200) {
+              lastPredictionUpdate = now;
+              setPredictionSource(cloneSimulationState(next));
+            }
+            setRuntimeError(null);
+          }
+        } catch (error) {
+          reportRuntimeError(error);
         }
+      } else {
+        simulatedTimeDebtRef.current = 0;
       }
 
       if (now - lastHudUpdate >= 450) {
@@ -289,7 +476,7 @@ export default function GravityLab() {
 
     frame = requestAnimationFrame(animate);
     return () => cancelAnimationFrame(frame);
-  }, [analysisBodyId, appendTrailSample, paused, selectedBodyId, timeScale]);
+  }, [analysisBodyId, appendTrailSample, paused, reportRuntimeError, selectedBodyId, timeScale]);
 
   function loadPreset(id: BuiltInPresetId) {
     const preset = id === "random-system"
@@ -298,6 +485,7 @@ export default function GravityLab() {
     const next = createSimulationState(preset.bodies, preset.config);
     resetStateRef.current = cloneSimulationState(next);
     lastTrailTimeRef.current = next.time;
+    lastTrailWallTimeRef.current = 0;
     setActivePresetId(id);
     setPresetDescription(preset.description);
     setSelectedBodyId(preset.focusBodyId);
@@ -306,6 +494,7 @@ export default function GravityLab() {
     setTrails(initialTrails(next.bodies));
     setTrailSamplingInterval(Math.max(1, next.config.timeStep * 8));
     setHistory([]);
+    setRuntimeError(null);
     setPaused(false);
     commitSimulation(next, true);
   }
@@ -313,19 +502,29 @@ export default function GravityLab() {
   function resetSimulation() {
     const next = cloneSimulationState(resetStateRef.current);
     lastTrailTimeRef.current = next.time;
+    lastTrailWallTimeRef.current = 0;
     setTrails(initialTrails(next.bodies));
     setHistory([]);
+    setRuntimeError(null);
     setPaused(false);
     commitSimulation(next, true);
   }
 
   function updateBody(bodyId: string, updater: (body: CelestialBody) => CelestialBody) {
     const current = simulationRef.current;
-    const next = refreshAccelerations({
-      ...current,
-      bodies: current.bodies.map((body) => body.id === bodyId ? updater(body) : body),
-    });
-    commitSimulation(next, true);
+    try {
+      const next = refreshAccelerations({
+        ...current,
+        bodies: current.bodies.map((body) => body.id === bodyId
+          ? sanitizeInteractiveBody(updater(body))
+          : body),
+      });
+      setRuntimeError(null);
+      commitSimulation(next);
+      schedulePredictionRefresh(next);
+    } catch (error) {
+      reportRuntimeError(error);
+    }
   }
 
   function patchSelected(patch: Partial<CelestialBody>) {
@@ -341,59 +540,81 @@ export default function GravityLab() {
 
   function updateConfig(patch: Partial<SimulationState["config"]>) {
     const current = simulationRef.current;
-    const next = refreshAccelerations({ ...current, config: { ...current.config, ...patch } });
-    commitSimulation(next, true);
+    try {
+      const config = { ...current.config, ...patch };
+      config.gravitationalConstant = clamp(config.gravitationalConstant, 0, MAX_GRAVITATIONAL_CONSTANT);
+      config.timeStep = clamp(config.timeStep, 0.001, MAX_TIMESTEP);
+      config.softening = clamp(config.softening, 0, MAX_SOFTENING);
+      const next = refreshAccelerations({ ...current, config });
+      setRuntimeError(null);
+      commitSimulation(next);
+      schedulePredictionRefresh(next);
+    } catch (error) {
+      reportRuntimeError(error);
+    }
   }
 
   function addBody() {
     const current = simulationRef.current;
-    const anchor = selectedBody ?? current.bodies[0];
-    const viewOffset = Math.max(anchor?.radius ? anchor.radius * 12 : 0, 30 / camera.pixelsPerMeter);
-    const id = `body-${bodySequenceRef.current++}-${Date.now().toString(36)}`;
-    const dominantMass = anchor?.mass ?? 5.9722e24;
-    const orbitalSpeed = Math.sqrt(
-      Math.max(0, current.config.gravitationalConstant * dominantMass / Math.max(viewOffset, 1)),
-    );
-    const body = createBody({
-      id,
-      name: `OBJECT ${String(current.bodies.length + 1).padStart(2, "0")}`,
-      mass: 5.9722e24,
-      radius: 6_371_000,
-      density: 5_514,
-      position: {
-        x: (anchor?.position.x ?? camera.center.x) + viewOffset,
-        y: anchor?.position.y ?? camera.center.y,
-      },
-      velocity: {
-        x: anchor?.velocity.x ?? 0,
-        y: (anchor?.velocity.y ?? 0) + orbitalSpeed,
-      },
-      trailVisible: true,
-    });
-    const next = refreshAccelerations({ ...current, bodies: [...current.bodies, body] });
-    setSelectedBodyId(id);
-    setTrails((existing) => [...existing, { bodyId: id, points: [{ ...body.position }] }]);
-    commitSimulation(next, true);
+    if (current.bodies.length >= MAX_BODIES) return;
+    try {
+      const anchor = selectedBody ?? current.bodies[0];
+      const viewOffset = Math.max(anchor?.radius ? anchor.radius * 12 : 0, 30 / camera.pixelsPerMeter);
+      const id = `body-${bodySequenceRef.current++}-${Date.now().toString(36)}`;
+      const dominantMass = anchor?.mass ?? 5.9722e24;
+      const orbitalSpeed = Math.sqrt(
+        Math.max(0, current.config.gravitationalConstant * dominantMass / Math.max(viewOffset, 1)),
+      );
+      const body = createBody(sanitizeInteractiveBody({
+        id,
+        name: `OBJECT ${String(current.bodies.length + 1).padStart(2, "0")}`,
+        mass: 5.9722e24,
+        radius: 6_371_000,
+        density: 5_514,
+        position: {
+          x: (anchor?.position.x ?? camera.center.x) + viewOffset,
+          y: anchor?.position.y ?? camera.center.y,
+        },
+        velocity: {
+          x: anchor?.velocity.x ?? 0,
+          y: (anchor?.velocity.y ?? 0) + orbitalSpeed,
+        },
+        acceleration: { x: 0, y: 0 },
+        fixed: false,
+        trailVisible: true,
+      }));
+      const next = refreshAccelerations({ ...current, bodies: [...current.bodies, body] });
+      setSelectedBodyId(id);
+      setTrails((existing) => [...existing, { bodyId: id, points: [{ ...body.position }] }]);
+      commitSimulation(next, true);
+    } catch (error) {
+      reportRuntimeError(error);
+    }
   }
 
   function duplicateSelected() {
     if (!selectedBody) return;
     const current = simulationRef.current;
-    const id = `body-${bodySequenceRef.current++}-${Date.now().toString(36)}`;
-    const offset = Math.max(selectedBody.radius * 5, 18 / camera.pixelsPerMeter);
-    const duplicate = createBody({
-      ...selectedBody,
-      id,
-      name: `${selectedBody.name} COPY`,
-      fixed: false,
-      position: { x: selectedBody.position.x + offset, y: selectedBody.position.y + offset * 0.2 },
-      velocity: { ...selectedBody.velocity },
-      acceleration: { x: 0, y: 0 },
-    });
-    const next = refreshAccelerations({ ...current, bodies: [...current.bodies, duplicate] });
-    setSelectedBodyId(id);
-    setTrails((existing) => [...existing, { bodyId: id, points: [{ ...duplicate.position }] }]);
-    commitSimulation(next, true);
+    if (current.bodies.length >= MAX_BODIES) return;
+    try {
+      const id = `body-${bodySequenceRef.current++}-${Date.now().toString(36)}`;
+      const offset = Math.max(selectedBody.radius * 5, 18 / camera.pixelsPerMeter);
+      const duplicate = createBody(sanitizeInteractiveBody({
+        ...selectedBody,
+        id,
+        name: `${selectedBody.name} COPY`,
+        fixed: false,
+        position: { x: selectedBody.position.x + offset, y: selectedBody.position.y + offset * 0.2 },
+        velocity: { ...selectedBody.velocity },
+        acceleration: { x: 0, y: 0 },
+      }));
+      const next = refreshAccelerations({ ...current, bodies: [...current.bodies, duplicate] });
+      setSelectedBodyId(id);
+      setTrails((existing) => [...existing, { bodyId: id, points: [{ ...duplicate.position }] }]);
+      commitSimulation(next, true);
+    } catch (error) {
+      reportRuntimeError(error);
+    }
   }
 
   function deleteSelected() {
@@ -431,10 +652,14 @@ export default function GravityLab() {
   }
 
   function stepForward() {
-    const next = stepSimulation(simulationRef.current);
-    setPaused(true);
-    appendTrailSample(next, true);
-    commitSimulation(next, true);
+    try {
+      const next = stepSimulation(simulationRef.current);
+      setPaused(true);
+      appendTrailSample(next, true);
+      commitSimulation(next, true);
+    } catch (error) {
+      reportRuntimeError(error);
+    }
   }
 
   function shiftSpeed(direction: -1 | 1) {
@@ -460,7 +685,14 @@ export default function GravityLab() {
   const activePreset = PRESETS.find((preset) => preset.id === activePresetId) ?? PRESETS[0];
 
   return (
-    <main className="gravity-lab">
+    <main
+      className="gravity-lab"
+      data-simulation-tick={simulation.tick}
+      data-simulation-time={simulation.time}
+      data-body-count={simulation.bodies.length}
+      data-simulation-paused={paused ? "true" : "false"}
+      data-runtime-error={runtimeError ?? ""}
+    >
       <aside className="left-rail instrument-panel">
         <div className="brand-block">
           <p className="micro-label">GRAVITATIONAL LAB / 01</p>
@@ -483,7 +715,9 @@ export default function GravityLab() {
               </button>
             ))}
           </div>
-          <button className="outline-action full-width" onClick={addBody}>＋ ADD BODY</button>
+          <button className="outline-action full-width" disabled={simulation.bodies.length >= MAX_BODIES} onClick={addBody}>
+            {simulation.bodies.length >= MAX_BODIES ? "SYSTEM LIMIT / 32 BODIES" : "＋ ADD BODY"}
+          </button>
         </div>
 
         <div className="rail-section preset-section">
@@ -509,6 +743,12 @@ export default function GravityLab() {
       </aside>
 
       <section className="universe-stage">
+        {runtimeError && (
+          <div className="simulation-alert" role="alert">
+            <span>SIMULATION PAUSED / {runtimeError}</span>
+            <button onClick={resetSimulation}>RESET SYSTEM</button>
+          </div>
+        )}
         <UniverseCanvas
           bodies={simulation.bodies}
           selectedBodyId={selectedBodyId}
@@ -524,6 +764,7 @@ export default function GravityLab() {
             label: referenceFrameMode.replaceAll("-", " ").toUpperCase(),
           }}
           hud={{ fps, timeScale, solver: "VELOCITY VERLET", status: paused ? "HOLD" : "LIVE" }}
+          renderFps={paused ? 12 : 30}
           vectorScale={vectorScale}
           gravityFieldDensity={gravityFieldDensity}
           onCameraChange={setCamera}
@@ -537,8 +778,8 @@ export default function GravityLab() {
           <span>G {formatScientific(simulation.config.gravitationalConstant, 4)} N·M²/KG²</span>
         </div>
         <div className="stage-tools" aria-label="Camera tools">
-          <button onClick={() => setCamera((current) => ({ ...current, pixelsPerMeter: current.pixelsPerMeter * 1.35 }))} aria-label="Zoom in">＋</button>
-          <button onClick={() => setCamera((current) => ({ ...current, pixelsPerMeter: current.pixelsPerMeter / 1.35 }))} aria-label="Zoom out">−</button>
+          <button onClick={() => setCamera((current) => ({ ...current, pixelsPerMeter: clamp(current.pixelsPerMeter * 1.35, MIN_CAMERA_ZOOM, MAX_CAMERA_ZOOM) }))} aria-label="Zoom in">＋</button>
+          <button onClick={() => setCamera((current) => ({ ...current, pixelsPerMeter: clamp(current.pixelsPerMeter / 1.35, MIN_CAMERA_ZOOM, MAX_CAMERA_ZOOM) }))} aria-label="Zoom out">−</button>
           <button onClick={focusSelected} aria-label="Focus selected body">⌖</button>
           <button className="mobile-inspector-toggle" onClick={() => setMobileInspectorOpen((open) => !open)} aria-label="Toggle inspector">OBJ</button>
         </div>
@@ -565,6 +806,7 @@ export default function GravityLab() {
                 engineHud: false,
               }}
               interactive={false}
+              renderFps={24}
               ariaLabel="Magnified live Earth and Moon local reference view"
             />
           </div>
@@ -608,7 +850,7 @@ export default function GravityLab() {
             <NumberField label="GRAVITATIONAL CONSTANT" unit="N·M²/KG²" value={simulation.config.gravitationalConstant} step={1e-15} onChange={(value) => updateConfig({ gravitationalConstant: Math.max(1e-20, value) })} />
             <NumberField label="PHYSICS TIMESTEP" unit="SEC" value={simulation.config.timeStep} step={1} onChange={(value) => updateConfig({ timeStep: Math.max(0.001, value) })} />
             <NumberField label="NUMERICAL SOFTENING" unit="KM" value={simulation.config.softening / 1_000} step={1} onChange={(value) => updateConfig({ softening: Math.max(0, value * 1_000) })} />
-            <NumberField label="TRAIL LENGTH" unit="PTS" value={trailLength} step={10} onChange={(value) => setTrailLength(Math.max(20, Math.min(1_500, Math.round(value))))} />
+            <NumberField label="TRAIL LENGTH" unit="PTS" value={trailLength} step={10} onChange={(value) => setTrailLength(Math.max(20, Math.min(800, Math.round(value))))} />
             <NumberField label="TRAIL SAMPLE" unit="SEC" value={trailSamplingInterval} step={1} onChange={(value) => setTrailSamplingInterval(Math.max(0.01, value))} />
             <NumberField label="FIELD DENSITY" unit="PX" value={gravityFieldDensity} step={2} onChange={(value) => setGravityFieldDensity(Math.max(30, Math.min(120, value)))} />
             <NumberField label="VECTOR SCALE" unit="×" value={vectorScale} step={0.1} onChange={(value) => setVectorScale(Math.max(0.1, Math.min(8, value)))} />
@@ -693,7 +935,7 @@ function ObjectInspector({ body, bodyNumber, bodyCount, onPatch, onDuplicate, on
       </div>
       <div className="object-actions">
         <button onClick={onFocus}>⌖ FOCUS</button>
-        <button onClick={onDuplicate}>⧉ DUPLICATE</button>
+        <button disabled={bodyCount >= MAX_BODIES} onClick={onDuplicate}>⧉ DUPLICATE</button>
         <button className="danger-action" disabled={bodyCount <= 2} onClick={onDelete}>× DELETE</button>
       </div>
     </div>
@@ -712,6 +954,11 @@ interface AnalysisInspectorProps {
 }
 
 function AnalysisInspector({ selected, comparison, bodies, comparisonId, onComparisonChange, metrics, diagnostics, history }: AnalysisInspectorProps) {
+  const plotValues = useMemo(() => ({
+    distance: history.map((sample) => sample.distance),
+    speed: history.map((sample) => sample.speed),
+    total: history.map((sample) => sample.total),
+  }), [history]);
   if (!selected) return <div className="empty-inspector">SELECT A PRIMARY OBJECT</div>;
   return (
     <div className="inspector-scroll analysis-panel">
@@ -729,9 +976,9 @@ function AnalysisInspector({ selected, comparison, bodies, comparisonId, onCompa
         </div>
       )}
       <div className="plot-stack">
-        <MiniPlot label="DISTANCE" values={history.map((sample) => sample.distance)} />
-        <MiniPlot label="RELATIVE SPEED" values={history.map((sample) => sample.speed)} />
-        <MiniPlot label="TOTAL ENERGY" values={history.map((sample) => sample.total)} />
+        <MiniPlot label="DISTANCE" values={plotValues.distance} />
+        <MiniPlot label="RELATIVE SPEED" values={plotValues.speed} />
+        <MiniPlot label="TOTAL ENERGY" values={plotValues.total} />
       </div>
       <div className="energy-table">
         <Metric label="KINETIC ENERGY" value={`${formatScientific(diagnostics.kineticEnergy, 2)} J`} />

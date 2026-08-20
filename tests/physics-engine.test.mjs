@@ -4,10 +4,14 @@ import test from "node:test";
 import {
   advanceSimulation,
   calculateBodyDynamics,
+  calculatePairwiseForces,
   calculateSystemDiagnostics,
   cloneSimulationState,
   createBody,
   createSimulationState,
+  forceVectorsOnBody,
+  predictTrajectories,
+  simulateDuration,
   stepSimulation,
 } from "../lib/physics.ts";
 
@@ -21,6 +25,38 @@ const body = (overrides) =>
     velocity: { x: 0, y: 0 },
     ...overrides,
   });
+
+test("duration simulation drops excess work at its substep safety limit", () => {
+  const state = createSimulationState([body({ id: "solo" })], {
+    gravitationalConstant: 0,
+    timeStep: 0.1,
+  });
+  const result = simulateDuration(state, 10, 0.1, 3);
+
+  assert.equal(result.state.tick, 3);
+  assert.ok(Math.abs(result.state.time - 0.3) < 1e-12);
+});
+
+test("elastic contact piles stay inside the per-step collision budget", () => {
+  const bodies = Array.from({ length: 32 }, (_, index) => body({
+    id: `pile-${index}`,
+    radius: 1,
+    position: { x: 0, y: 0 },
+  }));
+  const state = createSimulationState(bodies, {
+    gravitationalConstant: 0,
+    timeStep: 1,
+    collisionMode: "elastic",
+  });
+  const result = advanceSimulation(state, 1);
+
+  assert.ok(result.collisions.length <= 16);
+  assert.equal(result.state.bodies.length, bodies.length);
+  for (const candidate of result.state.bodies) {
+    assert.ok(Number.isFinite(candidate.position.x));
+    assert.ok(Number.isFinite(candidate.position.y));
+  }
+});
 
 test("pairwise gravity is symmetric and has the expected magnitude", () => {
   const bodyA = body({ id: "a", mass: 5e10 });
@@ -40,6 +76,78 @@ test("pairwise gravity is symmetric and has the expected magnitude", () => {
     dynamics[0].netForce.x + dynamics[1].netForce.x,
     0,
   );
+});
+
+test("selected-body force vectors match the complete pairwise calculation", () => {
+  const bodies = [
+    body({ id: "a", mass: 5, position: { x: -3, y: 1 } }),
+    body({ id: "b", mass: 7, position: { x: 4, y: -2 } }),
+    body({ id: "c", mass: 11, position: { x: 1, y: 8 } }),
+  ];
+  const config = { gravitationalConstant: 2, softening: 0.5 };
+  const selectedForces = forceVectorsOnBody(bodies, "b", config);
+  const pairwise = calculatePairwiseForces(bodies, config);
+
+  assert.equal(selectedForces.length, 2);
+  for (const force of selectedForces) {
+    const pair = pairwise.find((candidate) =>
+      (candidate.bodyAId === force.sourceBodyId && candidate.bodyBId === force.attractingBodyId) ||
+      (candidate.bodyBId === force.sourceBodyId && candidate.bodyAId === force.attractingBodyId));
+    assert.ok(pair);
+    const expected = pair.bodyAId === force.sourceBodyId ? pair.forceOnA : pair.forceOnB;
+    assert.deepEqual(force.vector, expected);
+    assert.equal(force.magnitude, pair.magnitude);
+  }
+});
+
+test("trajectory prediction stays bounded when absolute simulation time cannot advance", () => {
+  const state = createSimulationState([
+    body({ id: "a", position: { x: -1, y: 0 }, velocity: { x: 1, y: 0 } }),
+    body({ id: "b", position: { x: 1, y: 0 }, velocity: { x: -1, y: 0 } }),
+  ], {
+    gravitationalConstant: 0,
+    timeStep: 0.01,
+    collisionMode: "pass",
+  });
+  state.time = 1e30;
+
+  const predictions = predictTrajectories(state, {
+    horizon: 1,
+    integrationStep: 0.01,
+    sampleInterval: 0.25,
+    maxSteps: 100,
+  });
+
+  assert.equal(predictions.length, 2);
+  for (const trajectory of predictions) {
+    assert.ok(trajectory.points.length >= 4);
+    assert.ok(trajectory.points.length <= 6);
+    assert.ok(trajectory.points.at(-1).elapsedTime >= 1 - 1e-10);
+  }
+});
+
+test("trajectory prediction always samples its non-binary horizon at the step cap", () => {
+  const horizon = 20_796.03564164516;
+  const state = createSimulationState([
+    body({ id: "a", position: { x: -1, y: 0 }, velocity: { x: 1, y: 0 } }),
+    body({ id: "b", position: { x: 1, y: 0 }, velocity: { x: -1, y: 0 } }),
+  ], {
+    gravitationalConstant: 0,
+    timeStep: 0.001,
+    collisionMode: "pass",
+  });
+
+  const predictions = predictTrajectories(state, {
+    horizon,
+    integrationStep: 0.001,
+    sampleInterval: horizon * 2,
+    maxSteps: 275,
+  });
+
+  for (const trajectory of predictions) {
+    assert.equal(trajectory.points.length, 2);
+    assert.equal(trajectory.points.at(-1).elapsedTime, horizon);
+  }
 });
 
 test("velocity Verlet keeps a circular orbit bounded", () => {

@@ -35,6 +35,9 @@ yarn-error.log*
 .vercel
 
 /dist/
+/.desktop-dist/
+/desktop-dist/
+/release/
 /.wrangler/
 /.npm-cache/
 /outputs/
